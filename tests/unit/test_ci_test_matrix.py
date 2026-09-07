@@ -19,10 +19,18 @@ VERIFY_PACKAGE_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "verify-packa
 PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 REFACTOR_QUALIFICATION_FILES = {
     PROJECT_ROOT / "tests" / "unit" / "test_client_lifecycle_waves.py",
-    PROJECT_ROOT / "tests" / "_guardrails" / "test_client_operation_contract_inventory.py",
     PROJECT_ROOT / "tests" / "_guardrails" / "test_backend_coupling_observability.py",
 }
 PR_LIFECYCLE_CONTRACTS = {
+    PROJECT_ROOT / "tests" / "unit" / "test_client_lifecycle_waves.py": (
+        "test_open_is_transactional_and_concurrent_callers_coalesce",
+        "test_open_failure_rolls_back_every_transport_and_preserves_original",
+        "test_cancelling_non_owner_open_does_not_abort_owner",
+        "test_cancelled_close_aborts_hung_graceful_wait_but_finishes_teardown",
+        "test_close_reopen_allocates_a_new_resource_epoch",
+        "test_registered_child_self_close_fails_fast_without_leaking_admission",
+        "test_poll_callback_self_close_fails_fast_and_poll_settles_once",
+    ),
     PROJECT_ROOT / "tests" / "unit" / "test_runtime_lifecycle.py": (
         "test_root_open_is_idempotent_and_preserves_transport_generation",
         "test_root_close_runs_hooks_before_transport_resource_teardown",
@@ -180,6 +188,7 @@ def test_pr_matrix_runs_once_without_coverage_and_canonical_owns_reality() -> No
         "Run required external-reality probes",
         "Run Playwright-dependent unit tests serially",
         "Run critical contract guards",
+        "Run PR contract suites",
     }
     for name in canonical_steps:
         assert _step(test_job, name)["if"] == "matrix.canonical"
@@ -213,6 +222,11 @@ def test_pr_matrix_runs_once_without_coverage_and_canonical_owns_reality() -> No
     ) in critical_command
     assert "tests/unit/test_ci_test_matrix.py" in critical_command
 
+    pr_contract_command = str(_step(test_job, "Run PR contract suites")["run"])
+    assert "-m" in pr_contract_command
+    assert "pr_contract" in pr_contract_command
+    assert "--no-cov" in pr_contract_command
+
     smoke = _step(test_job, "Run Windows Playwright compatibility smoke serially")
     assert smoke["if"] == "matrix.windows_playwright"
     smoke_command = str(smoke["run"])
@@ -232,10 +246,27 @@ def test_refactor_qualification_is_out_of_prs_and_in_manual_nightly_release_lane
         assert "pytest.mark.refactor_qualification" in path.read_text(encoding="utf-8")
     for path, contract_names in PR_LIFECYCLE_CONTRACTS.items():
         source = path.read_text(encoding="utf-8")
-        assert "pytest.mark.refactor_qualification" not in source
-        assert "pytestmark = pytest.mark.repo_lint" not in source
+        tree = ast.parse(source)
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and target.id == "pytestmark":
+                        assigned_repr = ast.unparse(stmt.value)
+                        assert "refactor_qualification" not in assigned_repr
+                        assert "repo_lint" not in assigned_repr
+
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         for contract_name in contract_names:
-            assert f"def {contract_name}(" in source
+            assert contract_name in functions, f"Expected {contract_name} in {path}"
+            fn = functions[contract_name]
+            decorator_names = [ast.unparse(d) for d in fn.decorator_list]
+            assert not any("refactor_qualification" in d for d in decorator_names), (
+                f"{contract_name} in {path} must not be decorated with refactor_qualification"
+            )
 
     pr = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
     pr_test = pr["jobs"]["test"]
@@ -249,6 +280,10 @@ def test_refactor_qualification_is_out_of_prs_and_in_manual_nightly_release_lane
     manual_command = str(_step(manual, "Run refactor qualification tests")["run"])
     assert "-m refactor_qualification" in manual_command
     assert "--no-cov" in manual_command
+    historical_command = str(_step(manual, "Run historical qualification tests")["run"])
+    assert "--run-historical" in historical_command
+    assert "-m historical" in historical_command
+    assert "--no-cov" in historical_command
 
     nightly = yaml.safe_load(NIGHTLY_CHECKS_WORKFLOW.read_text(encoding="utf-8"))
     compatibility = nightly["jobs"]["compatibility"]
